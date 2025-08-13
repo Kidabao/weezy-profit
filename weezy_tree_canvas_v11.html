@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WEEZY 分潤 · 樹狀圖（Canvas · v11）</title>
+<style>
+  :root{--bg:#ffffff;--text:#1f2328;--muted:#6b7280;--line:#e6e6e6;--ok:#10b981}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font:14px/1.55 system-ui,-apple-system,"PingFang TC","Noto Sans TC",Segoe UI,Arial}
+  .page{width:90vw;max-width:1600px;margin:20px auto;padding:0 4px}
+  h1{font-size:20px;margin:0 0 8px}
+  .layout{display:flex;gap:8px;align-items:stretch}
+  .board{flex:1;border:1px solid var(--line);border-radius:12px;background:#fafafa;min-height:560px;position:relative;overflow:hidden}
+  #cv{width:100%;height:840px;display:block;cursor:grab}
+  #cv.grabbing{cursor:grabbing}
+  .overlay{position:absolute;left:12px;top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:2}
+  .card{border:1px solid var(--line);border-radius:10px;background:#fff;padding:8px 10px;display:flex;gap:8px;align-items:center}
+  button{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#111827;cursor:pointer}
+  button.primary{background:#111827;color:#fff;border-color:#111827}
+  button.warn{color:#b91c1c;border-color:#f3d4d4}
+  select{padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#fff}
+  .side{width:300px;transition:width .2s ease;overflow:hidden}
+  .side .panel{border:1px solid var(--line);border-radius:12px;background:#fff;height:100%;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+  .side h3{margin:0;font-size:13px;color:#111827;display:flex;justify-content:space-between;align-items:center}
+  .lvlist{display:flex;flex-direction:column;gap:4px;font-size:12px;color:#1f2328;max-height:760px;overflow:auto}
+  .lvitem{display:flex;justify-content:space-between;border-bottom:1px dashed #eee;padding:4px 0}
+  .toggle{position:absolute;right:8px;top:8px;z-index:3}
+  .toggle button{padding:6px 10px;font-size:12px}
+  .floatSel{position:absolute;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,.08);padding:6px;z-index:5}
+</style>
+</head>
+<body>
+  <div class="page">
+    <h1>WEEZY 分潤 · 樹狀圖（Canvas · v11）</h1>
+    <div class="layout">
+      <div class="board">
+        <div class="overlay">
+          <div class="card">
+            <button id="reset">建立/重置示例</button>
+            <button id="mark"  class="primary">標記為成交者</button>
+            <button id="del"   class="warn">刪除所選節點</button>
+          </div>
+          <div class="card" id="nodeEditor" style="display:none">
+            <span style="font-size:12px;color:#6b7280">選定節點等級</span>
+            <select id="lvSel"></select>
+            <button id="lvApply">更新</button>
+          </div>
+        </div>
+        <canvas id="cv"></canvas>
+        <div id="inlineSel" class="floatSel" style="display:none">
+          <select id="inlineLv"></select>
+        </div>
+      </div>
+
+      <aside class="side" id="side">
+        <div class="panel">
+          <h3>
+            <span>商品分潤表</span>
+            <span style="display:flex;gap:6px;align-items:center">
+              <span style="font-size:12px;color:#6b7280">商品</span>
+              <select id="prodSel" style="padding:4px 8px"></select>
+            </span>
+          </h3>
+          <div id="prodMeta" style="color:#6b7280;font-size:12px"></div>
+          <div id="lvList" class="lvlist"></div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+<script>
+// ---------- Data & Products ----------
+const PRODUCTS={p1:buildTable(15,30,2),p2:buildTable(15,15,1)};
+function buildTable(maxLv,top,bottom){const t={};const step=(top-bottom)/(maxLv-1);for(let lv=1;lv<=maxLv;lv++){t[lv]=Math.round((bottom+(lv-1)*step)*10)/10}return t}
+function pctBy(pk,lv){return PRODUCTS[pk][lv]??0}
+
+// ---------- State ----------
+let nodes=[],sellerId=null,selectedId=null,productKey="p1";
+let scale=1,offsetX=0,offsetY=0,drag=false,lastX=0,lastY=0;
+const $=s=>document.querySelector(s),side=$("#side"),cv=$("#cv"),ctx=cv.getContext("2d"),dpr=Math.max(1,window.devicePixelRatio||1);
+
+// ---------- Utils ----------
+function uid(){return Math.random().toString(36).slice(2,9)}
+function getNode(id){return nodes.find(n=>n.id===id)}
+function childrenOf(id){return nodes.filter(n=>n.parent===id)}
+function getRoot(){return nodes.find(n=>!n.parent)}
+function pathToRoot(id){const arr=[]; let cur=getNode(id); while(cur){arr.push(cur); cur=cur.parent?getNode(cur.parent):null} return arr}
+function isOnPath(id,seller){return pathToRoot(seller).some(n=>n.id===id)}
+function clamp(a,b,c){return Math.max(b,Math.min(c,a))}
+
+// ---------- CRUD ----------
+function addNode(parent,lv){
+  const id=uid(); if(parent){const p=getNode(parent);lv=Math.min(lv??1,p.lv??1)} else lv=null;
+  nodes.push({id,parent,lv,x:0,y:0,w:140,h:56}); return id;
+}
+function insertDown(node){
+  const kids=childrenOf(node.id);
+  if(kids.length===0){ // create first child
+    const id=addNode(node.id, node.lv??1); return id;
+  }else if(kids.length===1){ // vertical insert between node and its only child
+    const child=kids[0];
+    const id=addNode(node.id, Math.min(child.lv, node.lv)); // keep constraint
+    // reattach old child under new
+    child.parent=id;
+    return id;
+  }else{ // already branched, add another branch as child
+    const id=addNode(node.id, node.lv??1); return id;
+  }
+}
+function deleteNode(id){
+  const del=new Set([id]); let ch=true;
+  while(ch){ch=false; for(const n of nodes){if(n.parent&&del.has(n.parent)&&!del.has(n.id)){del.add(n.id);ch=true}}}
+  nodes=nodes.filter(n=>!del.has(n.id)); if(del.has(sellerId))sellerId=null; if(del.has(selectedId))selectedId=null;
+}
+function clampDesc(id){const me=getNode(id); for(const ch of childrenOf(id)){if(ch.lv>me.lv)ch.lv=me.lv; clampDesc(ch.id)}}
+
+// ---------- Layout (vertical) ----------
+function layout(){
+  if(!getRoot())return;
+  const W=cv.clientWidth,H=cv.clientHeight; cv.width=Math.floor(W*dpr); cv.height=Math.floor(H*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
+  const depth=new Map(); (function dfs(id,d){depth.set(id,d); for(const c of childrenOf(id))dfs(c.id,d+1)})(getRoot().id,0);
+  const maxD=Math.max(...depth.values()), colY=d=>60+d*((H-160)/Math.max(1,maxD));
+  function subtreeW(id){const kids=childrenOf(id); if(kids.length===0)return 200; return kids.map(k=>subtreeW(k.id)).reduce((a,b)=>a+b,0)}
+  const total=subtreeW(getRoot().id), left=Math.max(20,(W-total)/2);
+  function place(id,L){const n=getNode(id),kids=childrenOf(id),y=colY(depth.get(id));
+    if(kids.length===0){n.x=L+100-n.w/2;n.y=y;return L+200}
+    let cur=L; for(const k of kids)cur=place(k.id,cur);
+    const f=getNode(kids[0].id).x+getNode(kids[0].id).w/2, l=getNode(kids.at(-1).id).x+getNode(kids.at(-1).id).w/2;
+    n.x=(f+l)/2-n.w/2;n.y=y; return cur}
+  place(getRoot().id,left);
+}
+
+// ---------- Shares (v10 logic) ----------
+function computeShares(){
+  const res=new Map(); if(!sellerId) return res;
+  const path=pathToRoot(sellerId).filter(n=>n.lv!=null); if(path.length===0) return res;
+  const seller=path[0], sp=pctBy(productKey,seller.lv);
+  res.set(seller.id,{pct:+sp.toFixed(2), personal:true});
+
+  // group by percent
+  const map={}; for(const n of path){const p=pctBy(productKey,n.lv); (map[p]=map[p]||[]).push(n)}
+  const uniq=Object.keys(map).map(Number).sort((a,b)=>a-b);
+  if(uniq.length===0) return res;
+
+  const parent = path[1] || null;
+  const parentSame = !!(parent && pctBy(productKey,parent.lv)===sp);
+
+  if(uniq.length>=2){
+    const firstHigher = uniq[1];
+    const pool = firstHigher - sp;
+    if(parentSame){
+      // 50% to parent
+      const share = (res.get(parent.id) || {pct:0});
+      share.pct = +(share.pct + pool*0.5).toFixed(2);
+      share.team = true;
+      res.set(parent.id, share);
+      // 50% to firstHigher group
+      const g = map[firstHigher], each = g.length? (pool*0.5)/g.length : 0;
+      for(const n of g){
+        const s = (res.get(n.id) || {pct:0});
+        s.pct = +(s.pct + each).toFixed(2);
+        s.team = true;
+        res.set(n.id, s);
+      }
+    }else{
+      // normal
+      const g = map[firstHigher], each = g.length? pool/g.length : 0;
+      for(const n of g){
+        const s = (res.get(n.id) || {pct:0});
+        s.pct = +(s.pct + each).toFixed(2);
+        s.team = true;
+        res.set(n.id, s);
+      }
+    }
+  }
+  // remaining pools
+  for(let i=2;i<uniq.length;i++){
+    const lower = uniq[i-1], upper = uniq[i], pool = upper - lower;
+    const g = map[upper], each = g.length? pool/g.length : 0;
+    for(const n of g){
+      const s = (res.get(n.id) || {pct:0});
+      s.pct = +(s.pct + each).toFixed(2);
+      s.team = true;
+      res.set(n.id, s);
+    }
+  }
+  // mark peers
+  const lowest = map[uniq[0]] || [];
+  for(const n of lowest){
+    if(n.id===seller.id) continue;
+    const s = (res.get(n.id) || {pct:0});
+    s.peer = true; res.set(n.id, s);
+  }
+  return res;
+}
+
+// ---------- Draw ----------
+function draw(){
+  const W=cv.clientWidth,H=cv.clientHeight; cv.width=Math.floor(W*dpr); cv.height=Math.floor(H*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H); ctx.save(); ctx.translate(offsetX,offsetY); ctx.scale(scale,scale);
+  drawTree(); ctx.restore(); renderSide(); renderEditor(); positionInline();
+}
+function drawTree(){
+  if(nodes.length===0) return;
+  const shares=computeShares();
+  // edges
+  for(const p of nodes){const kids=childrenOf(p.id); if(kids.length===0)continue;
+    for(let i=0;i<kids.length;i++){const n=kids[i],x1=p.x+p.w/2+(i-(kids.length-1)/2)*4,y1=p.y+p.h,x2=n.x+n.w/2,y2=n.y;
+      ctx.strokeStyle="#cfd8e3"; ctx.lineWidth=1.2; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.bezierCurveTo(x1,(y1+y2)/2,x2,(y1+y2)/2,x2,y2); ctx.stroke();}}
+
+  // same-level brackets (cluster)
+  const clusters=buildSameLevelClusters();
+  for(const c of clusters){ if(c.nodes.length<=1) continue;
+    const top=Math.min(...c.nodes.map(n=>n.y))-8, bottom=Math.max(...c.nodes.map(n=>n.y+n.h))+8;
+    const cx = c.nodes[0].x + c.nodes[0].w + 16;
+    ctx.strokeStyle="#c7d2fe"; ctx.lineWidth=1; ctx.setLineDash([6,6]);
+    ctx.beginPath(); ctx.moveTo(cx, top); ctx.lineTo(cx, bottom); ctx.stroke(); ctx.setLineDash([]);
+    const lv=c.nodes[0].lv, txt=`同級 LV ${lv} × ${c.nodes.length}`;
+    const w=ctx.measureText(txt).width+12; roundRect(cx-w/2, top-22, w,18,9,"#eef2ff","#c7d2fe",1);
+    ctx.fillStyle="#1e40af"; ctx.font="12px system-ui"; ctx.textAlign="center"; ctx.fillText(txt,cx,top-8);
+  }
+
+  // nodes
+  for(const n of nodes){
+    const isRoot=!n.parent, onPath=sellerId?isOnPath(n.id,sellerId):false, sel=selectedId===n.id;
+    const fill=isRoot?"#fff7ed":"#fff", stroke=sel?"#ef4444":(onPath?"#10b981":"#e6e6e6");
+    roundRect(n.x,n.y,n.w,n.h,12,fill,stroke, sel?2:1.2);
+    ctx.fillStyle=isRoot?"#b45309":"#111827"; ctx.font="12px system-ui"; ctx.textAlign="center";
+    const label=isRoot?"WEEZY":`LV ${n.lv}（${pctBy(productKey,n.lv)}%）`; ctx.fillText(label, n.x+n.w/2, n.y+22);
+    const info=shares.get(n.id);
+    if(onPath && !isRoot && info){
+      ctx.font="11px system-ui"; ctx.textAlign="center";
+      if(info.personal){
+        ctx.fillStyle="#6b7280"; ctx.fillText(`我獲得 ${info.pct}%（個人）`, n.x+n.w/2, n.y+n.h-10);
+      }else if(info.team && info.peer){
+        ctx.fillStyle="#6b7280"; ctx.fillText(`我獲得 ${info.pct}%（團隊／同級）`, n.x+n.w/2, n.y+n.h-10);
+      }else if(info.team){
+        ctx.fillStyle="#6b7280"; ctx.fillText(`我獲得 ${info.pct}%（團隊）`, n.x+n.w/2, n.y+n.h-10);
+      }else if(info.peer){
+        ctx.fillStyle="#9ca3af"; ctx.fillText(`同級（0%）`, n.x+n.w/2, n.y+n.h-10);
+      }
+    }
+    // plus controls: red for vertical insert, yellow for sibling
+    drawPlus(n.x+n.w/2, n.y+n.h+12, "#ef4444", true); // down insert
+    drawPlus(n.x+n.w+12, n.y+n.h/2, "#f59e0b", false); // sibling
+  }
+  if(sellerId){const s=getNode(sellerId); if(s){ctx.fillStyle= "#10b981"; ctx.beginPath(); ctx.arc(s.x+s.w-10,s.y+12,6,0,Math.PI*2); ctx.fill();}}
+}
+function roundRect(x,y,w,h,r,fill,stroke,sw){if(sw==null)sw=1;ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r); if(fill){ctx.fillStyle=fill;ctx.fill()} if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=sw;ctx.stroke()}}
+function drawPlus(x,y,color,vertical){
+  ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x-6,y);ctx.lineTo(x+6,y);ctx.stroke();ctx.beginPath();ctx.moveTo(x,y-6);ctx.lineTo(x,y+6);ctx.stroke();
+  // small hit area memory list
+  hitAreas.push({x,y,r:10,kind:vertical?"addDown":"addSibling"});
+}
+
+// ---------- Brackets ----------
+function buildSameLevelClusters(){
+  if(!sellerId) return [];
+  const path=pathToRoot(sellerId).filter(n=>n.lv!=null);
+  if(path.length===0) return [];
+  const clusters=[];
+  let cur=[path[0]], curPct=pctBy(productKey,path[0].lv);
+  for(let i=1;i<path.length;i++){
+    const p=pctBy(productKey,path[i].lv);
+    if(p===curPct){cur.push(path[i])} else {clusters.push({pct:curPct,nodes:[...cur]}); cur=[path[i]]; curPct=p;}
+  }
+  clusters.push({pct:curPct,nodes:[...cur]});
+  return clusters;
+}
+
+// ---------- Side (product table) ----------
+function renderSide(){
+  const sel=$("#prodSel"); sel.innerHTML="";
+  const OPTIONS=[["p1","商品1（LV15→30%…LV1→2%）"],["p2","商品2（LV15→15%…LV1→1%）"]];
+  for(const [v,t] of OPTIONS){const o=document.createElement("option"); o.value=v;o.textContent=t; sel.appendChild(o)}
+  sel.value=productKey;
+  $("#prodMeta").textContent=productKey==="p1"?"LV15→30%，LV1→2%":"LV15→15%，LV1→1%";
+  const list=$("#lvList"); list.innerHTML=""; const order=Array.from({length:15},(_,i)=>15-i);
+  const tbl=PRODUCTS[productKey];
+  for(const lv of order){const el=document.createElement("div"); el.className="lvitem"; el.innerHTML=`<span><b>LV ${lv}</b></span><span>${tbl[lv]}%</span>`; list.appendChild(el)}
+}
+
+// ---------- Editor (top panel) ----------
+function renderEditor(){
+  const panel=$("#nodeEditor");
+  if(!selectedId){ panel.style.display="none"; return; }
+  panel.style.display="flex";
+  const n=getNode(selectedId); const sel=$("#lvSel"); sel.innerHTML="";
+  for(let i=1;i<=15;i++){const opt=document.createElement("option"); opt.value=i; opt.textContent="LV "+i; sel.appendChild(opt)}
+  sel.value = n.lv ?? 1;
+}
+
+// ---------- Inline Level Selector ----------
+const inlineBox=$("#inlineSel"), inlineLv=$("#inlineLv"); let inlineFor=null;
+for(let i=1;i<=15;i++){const opt=document.createElement("option"); opt.value=i; opt.textContent="LV "+i; inlineLv.appendChild(opt)}
+inlineLv.addEventListener("change",()=>{
+  if(!inlineFor) return;
+  const n=getNode(inlineFor); let newLv=parseInt(inlineLv.value);
+  const parent=n.parent?getNode(n.parent):null;
+  if(parent && parent.lv!=null && newLv>parent.lv) newLv=parent.lv;
+  n.lv=newLv; clampDesc(n.id); layout(); draw(); hideInline();
+});
+function showInlineFor(id){
+  inlineFor=id; const n=getNode(id); inlineLv.value=n.lv??1;
+  inlineBox.style.display="block"; positionInline();
+}
+function hideInline(){inlineBox.style.display="none"; inlineFor=null;}
+function positionInline(){
+  if(!inlineFor){inlineBox.style.display="none"; return;}
+  const n=getNode(inlineFor); if(!n){hideInline();return;}
+  const pt=worldToScreen(n.x+n.w+10, n.y+n.h/2-14);
+  inlineBox.style.left=pt.x+"px"; inlineBox.style.top=pt.y+"px";
+}
+function worldToScreen(x,y){return {x:x*scale+offsetX, y:y*scale+offsetY}}
+
+// ---------- Events ----------
+let hitAreas=[];
+function rebuildHitAreas(){hitAreas=[]; draw()} // draw will refill
+cv.addEventListener("click",e=>{
+  const pt=screenToWorld(e.offsetX,e.offsetY);
+  // test plus areas first
+  for(const a of hitAreas){
+    const dx=pt.x-a.x, dy=pt.y-a.y;
+    if(Math.hypot(dx,dy)<a.r){
+      // find nearest node by distance to this anchor
+      const nearest = nodes.reduce((best,n)=>{
+        const ax=a.kind==="addDown"? (n.x+n.w/2) : (n.x+n.w+12);
+        const ay=a.kind==="addDown"? (n.y+n.h+12) : (n.y+n.h/2);
+        const d=(ax-pt.x)**2+(ay-pt.y)**2; return d<best.d?{n,d}:{n:best.n,d:best.d}
+      },{n:null,d:1e12}).n;
+      if(!nearest) return;
+      if(a.kind==="addDown"){
+        const childId=insertDown(nearest); selectedId=childId; layout(); rebuildHitAreas();
+      }else{
+        if(!nearest.parent){alert("根節點不可新增同層"); return;}
+        const sibId=addNode(nearest.parent, nearest.lv??1); selectedId=sibId; layout(); rebuildHitAreas();
+      }
+      return;
+    }
+  }
+  // then hit node boxes
+  for(const n of nodes){
+    if(pt.x>=n.x && pt.x<=n.x+n.w && pt.y>=n.y && pt.y<=n.y+n.h){
+      selectedId=n.id; hideInline(); rebuildHitAreas(); return;
+    }
+  }
+  selectedId=null; hideInline(); rebuildHitAreas();
+});
+cv.addEventListener("dblclick",e=>{
+  const pt=screenToWorld(e.offsetX,e.offsetY);
+  for(const n of nodes){
+    if(pt.x>=n.x && pt.x<=n.x+n.w && pt.y>=n.y && pt.y<=n.y+n.h){
+      showInlineFor(n.id); return;
+    }
+  }
+});
+window.addEventListener("click",e=>{ // click outside inline box closes it
+  if(!inlineFor) return;
+  const r=inlineBox.getBoundingClientRect();
+  if(!(e.clientX>=r.left && e.clientX<=r.right && e.clientY>=r.top && e.clientY<=r.bottom)){
+    hideInline();
+  }
+});
+
+// Pan/zoom
+cv.addEventListener("mousedown",e=>{drag=true;lastX=e.clientX;lastY=e.clientY;cv.classList.add("grabbing")});
+window.addEventListener("mouseup",()=>{drag=false;cv.classList.remove("grabbing")});
+window.addEventListener("mousemove",e=>{if(!drag)return;const dx=e.clientX-lastX,dy=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;offsetX+=dx;offsetY+=dy;draw()});
+cv.addEventListener("wheel",e=>{e.preventDefault();const m={x:e.offsetX,y:e.offsetY},b=screenToWorld(m.x,m.y);const z=Math.exp(-e.deltaY*0.001),ns=clamp(scale*z,0.5,3);scale=ns;const a=screenToWorld(m.x,m.y);offsetX+=(a.x-b.x)*scale;offsetY+=(a.y-b.y)*scale;draw()},{passive:false});
+function screenToWorld(sx,sy){return {x:(sx-offsetX)/scale,y:(sy-offsetY)/scale}}
+
+// Top controls
+document.getElementById("reset").onclick=()=>makeDefault();
+document.getElementById("mark").onclick=()=>{if(!selectedId){alert("請先點選節點");return} sellerId=selectedId; draw()};
+document.getElementById("del").onclick=()=>{
+  if(!selectedId){alert("請先點選節點");return}
+  const n=getNode(selectedId);
+  if(!n.parent){alert("不可刪除根節點");return}
+  if(confirm("刪除此節點（含子樹）？")){deleteNode(selectedId); layout(); rebuildHitAreas()}
+};
+document.getElementById("lvApply").onclick=()=>{
+  if(!selectedId) return;
+  const n=getNode(selectedId); const val=parseInt(document.getElementById("lvSel").value);
+  if(isNaN(val)) return;
+  let newLv=Math.max(1,Math.min(15,val));
+  const parent=n.parent?getNode(n.parent):null;
+  if(parent && parent.lv!=null && newLv>parent.lv) newLv=parent.lv;
+  n.lv=newLv; clampDesc(n.id); layout(); rebuildHitAreas();
+};
+document.getElementById("prodSel").onchange=e=>{productKey=e.target.value; draw()};
+
+// ---------- Init ----------
+function renderProductSelectInit(){
+  const sel=$("#prodSel"); sel.innerHTML="";
+  for(const key of Object.keys(PRODUCTS)){
+    const op=document.createElement("option"); op.value=key; op.textContent= key==="p1"?"商品1（LV15→30%…LV1→2%）":"商品2（LV15→15%…LV1→1%）"; sel.appendChild(op);
+  }
+  sel.value=productKey;
+}
+function makeDefault(){
+  nodes=[];
+  const root=addNode(null,null);
+  const a=addNode(root,1);
+  const b=addNode(a,1);
+  const c=addNode(b,1);
+  const d=addNode(c,1);
+  const e=addNode(d,1);
+  const seller=addNode(e,1);
+  sellerId=seller; selectedId=seller;
+  scale=1; offsetX=0; offsetY=0; renderProductSelectInit();
+  layout(); rebuildHitAreas();
+}
+window.addEventListener("resize",()=>{layout();draw()});
+function rebuildHitAreas(){hitAreas=[]; draw()}
+
+makeDefault();
+</script>
+</body>
+</html>
